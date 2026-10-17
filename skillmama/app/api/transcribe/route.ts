@@ -23,6 +23,7 @@ function provider() {
   return null;
 }
 
+// Whisper and ElevenLabs read the format from the file name, so make sure it has one.
 function fileName(type: string) {
   if (type.includes("mp4") || type.includes("m4a")) return "recording.mp4";
   if (type.includes("ogg")) return "recording.ogg";
@@ -35,6 +36,7 @@ async function transcribeWithElevenLabs(audio: Blob, name: string, apiKey: strin
   const body = new FormData();
   body.append("file", audio, name);
   body.append("model_id", "scribe_v2");
+  // No language_code: English and German are both detected.
 
   const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
     method: "POST",
@@ -54,6 +56,7 @@ async function transcribeWithWhisper(audio: Blob, name: string, apiKey: string) 
   body.append("file", audio, name);
   body.append("model", "whisper-1");
   body.append("response_format", "text");
+  // No language: English and German are both detected.
 
   const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
     method: "POST",
