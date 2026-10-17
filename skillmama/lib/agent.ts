@@ -1,321 +1,283 @@
 // Person 3 — Claude. See worksplit.md Role 3.
-// With ANTHROPIC_API_KEY, Claude chooses a skill and writes the words the mom reads.
-// Activities still come from the JSON, not from the model. With no key, or if Claude
-// fails, runDemoAgent keeps the same JSON shape so the demo still plays.
+// Server only: imports the Anthropic SDK and reads ANTHROPIC_API_KEY.
 
-import { activityPool, emergency, feelings, normalizeActivities, runDemoAgent } from "./demo-agent";
-import { buildSkillDraft } from "./skills/create";
-import { selectActivities } from "./skills/montessori";
+/** The model, in one place. Current Claude Sonnet per today's Anthropic docs. */
+export const CLAUDE_MODEL = "claude-sonnet-5-5";
+
+import Anthropic from "@anthropic-ai/sdk";
+import type { BetaMessageParam, BetaTool, BetaToolResultBlockParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
+import { findActivities, type MontessoriToolInput } from "./skills/montessori";
 import {
-  BUILDER_QUESTIONS,
-  SKILL_EXPLANATION,
-  type Activity,
-  type AgentRequest,
-  type AgentResponse,
-  type Corpus,
-  type SkillDraft,
-} from "./types";
+  CREATE_SKILL_QUESTIONS,
+  draftSkill,
+  withSafetyRules,
+  type CompleteJson,
+  type CreateSkillToolInput,
+} from "./skills/create";
+import type { Activity, AgentRequest, AgentResponse, Corpus, SkillCard } from "./types";
 
-export const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL?.trim() || "claude-sonnet-5-5";
+export type { AgentRequest, AgentResponse };
 
-const FAIL = "The answer isn’t coming through right now. You can send the sentence again in a moment.";
+export const AGENT_UNAVAILABLE_ERROR =
+  "The answer isn’t coming through right now. You can send the sentence again in a moment.";
 
-const SYSTEM = `You are SkillMama, talking to a mom who is in the room with her baby.
-Short sentences. Calm. Concrete. No diagnosis.
-Ask at most one follow-up, and only when baby.ageMonths is missing or 0: ask how many months old the baby is.
-When she asks what to do, Montessori, play, or keeping the baby busy: call montessori_activity.
-When one of her saved skills fits the question: do not call a tool. Answer from that skill's markdown.
-When the topic has no skill yet, especially feelings or emotional development, or she asks to make a skill: call create_skill.
-Stay inside tool results for activities. Do not invent activities.
-Emergency (not breathing, unconscious, blue lips): say to call 112 now, and 116 117 for non-emergency medical help in Germany. Call no tool.
-When you are not calling a tool, reply with one JSON object only, no markdown fence:
-{"reply":"","skillUsed":"","mode":"use","learnPrompt":""}
-skillUsed is the saved skill name, montessori_activity, create_skill, or "".
-learnPrompt is one sentence she can say next time.`;
+/** Thrown when the key is missing or Claude can't be reached. The route turns it into a 502. */
+export class AgentUnavailableError extends Error {}
 
-type ContentBlock = {
-  type: string;
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: Record<string, unknown>;
-};
+const MAX_TURNS = 5;
 
-type ClaudeMessage = {
-  role: "user" | "assistant";
-  content: string | ContentBlock[];
-};
+const SYSTEM_PROMPT = `You are SkillMama. You are talking to a mom who is in the room with her baby right now.
+Write short sentences. Calm, warm, concrete. No jargon.
 
-const TOOLS = [
+How to decide:
+- Emergency first. If the message describes a medical emergency (not breathing, unconscious, blue lips, seizure, a bad fall, poisoning), call no tool. In reply, tell her to call 112 now, and 116 117 for non-emergency medical help in Germany. Set learnPrompt to "".
+- Ask at most one follow-up. The only follow-up you need is the baby's age, and only when baby.ageMonths is missing or 0 and you would need it. Then call no tool and put the one question in reply. Set learnPrompt to "Next time you can say your baby's age in months in the same sentence."
+- When the question is about what to do with the baby, Montessori, play, activities, or keeping the baby busy: call montessori_activity.
+- When one of her saved skills (momSkills) fits the question: follow that skill's markdown, answer in reply, and set skillUsed to that skill's name. Call no tool.
+- When the question is a topic that has no skill yet, especially feelings and emotional development: call create_skill.
+- The mom may write in German or English. Same rules. Answer in the language she used.
+
+Activities:
+- Use only activities from the montessori_activity tool result. Never invent one. Leave out anything that is not in the result.
+- Fit what she has at home (baby.materials) and her time (baby.minutesAvailable).
+- The app shows each activity as a card with how to prepare, what to observe, and why it helps. Your reply is one or two short sentences that introduce them. Do not repeat the cards.
+
+Always:
+- Offer a diagnosis zero times. Concerns about milestones or health go to the pediatrician.
+- When you explain a skill, write for someone who has never written a prompt. One sentence per section.
+- learnPrompt is one sentence she can say next time, starting with "Next time you can say:". Use only facts from <baby>; never invent an age or materials.
+
+Your final answer is JSON: reply, learnPrompt, skillUsed (the momSkills name you followed, or "").`;
+
+const TOOLS: BetaTool[] = [
   {
     name: "montessori_activity",
     description:
-      "Find up to 3 Montessori activities for this baby's age, using materials at home and skipping ones already done.",
+      "Finds 1–3 Montessori activities for the baby's age from the app's research list. Use it for any question about what to do or play with the baby.",
     input_schema: {
       type: "object",
       properties: {
-        babyAgeMonths: { type: "integer" },
-        situation: { type: "string" },
-        avoidIds: { type: "array", items: { type: "string" } },
+        babyAgeMonths: { type: "number", description: "The baby's age in months." },
+        situation: { type: "string", description: "What the mom said about the moment, in a few words." },
+        avoidIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Activity ids to leave out.",
+        },
       },
       required: ["babyAgeMonths"],
+      additionalProperties: false,
     },
+    strict: true,
   },
   {
     name: "create_skill",
     description:
-      "Start a new skill when no saved skill fits. Returns the 3 builder questions. Does not write the skill yet.",
+      "Starts building a new skill with the mom when her question has no skill yet, for example feelings or emotional development. Returns 3 questions the app will ask her.",
     input_schema: {
       type: "object",
       properties: {
-        topic: { type: "string" },
-        babyAgeMonths: { type: "integer" },
+        topic: { type: "string", description: "The topic in 1–3 English words, e.g. \"emotional development\"." },
+        babyAgeMonths: { type: "number" },
       },
       required: ["topic"],
+      additionalProperties: false,
     },
+    strict: true,
   },
 ];
 
-function createResponse(): AgentResponse {
+const FINAL_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    reply: { type: "string" },
+    learnPrompt: { type: "string" },
+    skillUsed: { type: "string" },
+  },
+  required: ["reply", "learnPrompt", "skillUsed"],
+  additionalProperties: false,
+};
+
+type FinalAnswer = { reply: string; learnPrompt: string; skillUsed: string };
+
+function getClient() {
+  if (!process.env.ANTHROPIC_API_KEY) throw new AgentUnavailableError("ANTHROPIC_API_KEY is not set");
+  return new Anthropic({ timeout: 60_000, maxRetries: 1 });
+}
+
+/** Common request fields. Server-side fallback reroutes a refused request instead of stopping. */
+function baseParams() {
   return {
-    reply:
-      "There isn’t a skill for this yet. Three short questions give it your baby’s moment, not a generic answer.",
-    skillUsed: "create_skill",
-    mode: "create",
-    results: BUILDER_QUESTIONS,
-    learnPrompt: "Good context is what makes the next answer specific.",
-  };
-}
-
-function parseJsonObject(text: string): Record<string, unknown> | null {
-  const start = text.indexOf("{");
-  const end = text.lastIndexOf("}");
-  if (start < 0 || end <= start) return null;
-  try {
-    const value = JSON.parse(text.slice(start, end + 1)) as unknown;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-    return value as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-}
-
-function textFrom(blocks: ContentBlock[]) {
-  return blocks
-    .filter((block) => block.type === "text" && block.text)
-    .map((block) => block.text)
-    .join("\n");
-}
-
-async function messages(body: Record<string, unknown>) {
-  const key = process.env.ANTHROPIC_API_KEY;
-  if (!key) throw new Error("no key");
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(25000),
-  });
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    console.error("Claude request failed", response.status, detail);
-    throw new Error(FAIL);
-  }
-  return (await response.json()) as { content?: ContentBlock[]; stop_reason?: string };
-}
-
-function activitiesFor(request: AgentRequest, corpus: Corpus, avoidIds: string[]) {
-  const baby = request.baby;
-  const completed = [...new Set([...(baby.completedActivityIds ?? []), ...avoidIds])];
-  const pool = activityPool(normalizeActivities(corpus.activities), baby.ageMonths, completed);
-  return selectActivities(pool, { ...baby, completedActivityIds: completed });
-}
-
-function activityResponse(activities: Activity[], reply: string, learnPrompt: string): AgentResponse {
-  return {
-    reply: reply || "Set one up, then wait.",
-    skillUsed: "montessori_activity",
-    mode: "use",
-    results: activities,
-    learnPrompt: learnPrompt || "Next time you can say: Help me find the right Montessori activity for my kid.",
-  };
-}
-
-async function draftWithClaude(request: AgentRequest, corpus: Corpus): Promise<AgentResponse | null> {
-  const answers = request.builderAnswers;
-  if (!answers) return null;
-  const baby = request.baby;
-  const user = `Write a Claude skill for this mom. Return one JSON object only:
-{"markdown":"...","explanation":{"whenToUse":"","instructions":"","safetyRules":"","outputFormat":""}}
-The markdown needs frontmatter (name, description, age_range_months, created_by: mom, created_at) and the four sections ## When to use, ## Instructions, ## Safety rules, ## Output format.
-name is lowercase with hyphens. Each explanation value is one plain sentence for someone who has never written a prompt.
-Baby: ${baby.name || "the baby"}, ${baby.ageMonths} months. Materials: ${baby.materials}. Minutes: ${baby.minutesAvailable}.
-She wants help with: ${answers.wantHelpWith}
-A recent moment: ${answers.recentMoment}
-The answer should look like: ${answers.answerShouldLookLike}
-Aim for this example:
-${corpus.exampleMarkdown}
-Safety rules to include:
-${corpus.safetyMarkdown}`;
-
-  const result = await messages({
     model: CLAUDE_MODEL,
-    max_tokens: 4096,
-    system: SYSTEM,
-    messages: [{ role: "user", content: user }],
-  });
-  const parsed = parseJsonObject(textFrom(result.content ?? []));
-  const markdown = typeof parsed?.markdown === "string" ? parsed.markdown.trim() : "";
-  const explanation = parsed?.explanation;
-  if (!markdown.includes("## When to use") || !markdown.includes("## Safety rules")) return null;
-  const local = buildSkillDraft(corpus.exampleMarkdown, corpus.safetyMarkdown, answers);
-  const draft: SkillDraft = {
-    markdown: markdown.includes(corpus.safetyMarkdown.slice(0, 40))
-      ? markdown
-      : `${markdown.trim()}\n\n${corpus.safetyMarkdown.trim()}\n`,
-    explanation: {
-      whenToUse:
-        explanation && typeof explanation === "object" && typeof (explanation as SkillDraft["explanation"]).whenToUse === "string"
-          ? (explanation as SkillDraft["explanation"]).whenToUse
-          : SKILL_EXPLANATION.whenToUse,
-      instructions:
-        explanation && typeof explanation === "object" && typeof (explanation as SkillDraft["explanation"]).instructions === "string"
-          ? (explanation as SkillDraft["explanation"]).instructions
-          : SKILL_EXPLANATION.instructions,
-      safetyRules:
-        explanation && typeof explanation === "object" && typeof (explanation as SkillDraft["explanation"]).safetyRules === "string"
-          ? (explanation as SkillDraft["explanation"]).safetyRules
-          : SKILL_EXPLANATION.safetyRules,
-      outputFormat:
-        explanation && typeof explanation === "object" && typeof (explanation as SkillDraft["explanation"]).outputFormat === "string"
-          ? (explanation as SkillDraft["explanation"]).outputFormat
-          : SKILL_EXPLANATION.outputFormat,
-    },
-  };
-  if (!draft.explanation.whenToUse) draft.explanation = local.explanation;
-  return {
-    reply: "This is a new skill, written from what you just told me. Read it, then save it to your library.",
-    skillUsed: "create_skill",
-    mode: "draft",
-    results: draft,
-    learnPrompt: "Next time you can open this skill from your library.",
+    max_tokens: 16000,
+    betas: ["server-side-fallback-2026-07-01"],
+    fallbacks: "default" as const,
   };
 }
 
-async function routeWithClaude(request: AgentRequest, corpus: Corpus): Promise<AgentResponse | null> {
-  const baby = request.baby;
-  const skills = (request.momSkills ?? [])
-    .map((skill) => `SKILL ${skill.name}\n${skill.description}\n${skill.markdown}`)
-    .join("\n\n");
-  const history: ClaudeMessage[] = [
-    {
-      role: "user",
-      content: `Message: ${request.message}
-Baby: ${baby.name || "baby"}, ${baby.ageMonths} months. Materials: ${baby.materials || "not named"}. Minutes: ${baby.minutesAvailable}. Already done: ${(baby.completedActivityIds ?? []).join(", ") || "none"}.
-Saved skills:
-${skills || "(none yet)"}
-Seed skill name: montessori-activity-finder.`,
-    },
-  ];
+function textOf(content: Anthropic.Beta.BetaContentBlock[]) {
+  return content
+    .filter((block): block is Anthropic.Beta.BetaTextBlock => block.type === "text")
+    .map((block) => block.text)
+    .join("");
+}
 
-  let chosen: Activity[] | null = null;
-
-  for (let turn = 0; turn < 3; turn += 1) {
-    const result = await messages({
-      model: CLAUDE_MODEL,
-      max_tokens: 4096,
-      system: SYSTEM,
-      tools: TOOLS,
-      messages: history,
-    });
-    const blocks = result.content ?? [];
-    const toolUses = blocks.filter((block) => block.type === "tool_use" && block.id && block.name);
-    if (toolUses.length === 0) {
-      const parsed = parseJsonObject(textFrom(blocks));
-      if (chosen) {
-        return activityResponse(
-          chosen,
-          typeof parsed?.reply === "string" ? parsed.reply : textFrom(blocks),
-          typeof parsed?.learnPrompt === "string" ? parsed.learnPrompt : "",
-        );
-      }
-      if (parsed && typeof parsed.reply === "string") {
-        const skillUsed = typeof parsed.skillUsed === "string" ? parsed.skillUsed : "";
-        return {
-          reply: parsed.reply,
-          skillUsed,
-          mode: "use",
-          results: [],
-          learnPrompt: typeof parsed.learnPrompt === "string" ? parsed.learnPrompt : "",
-        };
-      }
-      return null;
-    }
-
-    history.push({ role: "assistant", content: blocks });
-    const toolResults: ContentBlock[] = [];
-
-    for (const tool of toolUses) {
-      if (tool.name === "create_skill") {
-        const text = request.message.toLowerCase();
-        if (feelings(text) && (request.momSkills?.length ?? 0) > 0 && !/template:/.test(text)) {
-          return null;
-        }
-        return createResponse();
-      }
-      if (tool.name === "montessori_activity") {
-        const avoid = Array.isArray(tool.input?.avoidIds)
-          ? tool.input.avoidIds.filter((id): id is string => typeof id === "string")
-          : [];
-        chosen = activitiesFor(request, corpus, avoid);
-        toolResults.push({
-          type: "tool_result",
-          id: tool.id,
-          text: JSON.stringify(chosen),
-        } as ContentBlock);
-        continue;
-      }
-      toolResults.push({
-        type: "tool_result",
-        id: tool.id,
-        text: "Unknown tool.",
-      } as ContentBlock);
-    }
-
-    history.push({
-      role: "user",
-      content: toolResults.map((block) => ({
-        type: "tool_result",
-        tool_use_id: block.id,
-        content: block.text ?? "",
-      })) as unknown as ContentBlock[],
-    });
+function parseFinal(text: string): FinalAnswer {
+  try {
+    const json = JSON.parse(text) as Partial<FinalAnswer>;
+    return {
+      reply: typeof json.reply === "string" ? json.reply : "",
+      learnPrompt: typeof json.learnPrompt === "string" ? json.learnPrompt : "",
+      skillUsed: typeof json.skillUsed === "string" ? json.skillUsed : "",
+    };
+  } catch {
+    // Not JSON: still show what Claude wrote.
+    return { reply: text.trim(), learnPrompt: "", skillUsed: "" };
   }
+}
 
-  return chosen ? activityResponse(chosen, "", "") : null;
+function skillList(request: AgentRequest, corpus: Corpus) {
+  const seed = withSafetyRules(corpus.seedMarkdown, corpus.safetyMarkdown);
+  const mom = (request.momSkills ?? []).map((skill: SkillCard) => ({
+    name: skill.name,
+    description: skill.description,
+    markdown: withSafetyRules(skill.markdown, corpus.safetyMarkdown),
+  }));
+  return { seed, mom };
+}
+
+function contextMessage(request: AgentRequest, corpus: Corpus) {
+  const { seed, mom } = skillList(request, corpus);
+  return [
+    `<baby>${JSON.stringify(request.baby ?? {})}</baby>`,
+    `<seed_skill tool="montessori_activity">\n${seed}\n</seed_skill>`,
+    mom.length
+      ? `<mom_skills>\n${mom
+          .map((skill) => `<skill name="${skill.name}">\n${skill.markdown}\n</skill>`)
+          .join("\n")}\n</mom_skills>`
+      : "<mom_skills>none saved yet</mom_skills>",
+    `<message>${request.message}</message>`,
+  ].join("\n\n");
 }
 
 export async function runAgent(request: AgentRequest, corpus: Corpus): Promise<AgentResponse> {
-  const demo = runDemoAgent(request, corpus);
-  const message = request.message?.trim() ?? "";
-  const text = message.toLowerCase();
-
-  if (!process.env.ANTHROPIC_API_KEY) return demo;
-  if (emergency(text) || !request.baby || !Number.isInteger(request.baby.ageMonths) || request.baby.ageMonths <= 0) {
-    return demo;
-  }
+  const client = getClient();
+  const baby = request.baby;
 
   try {
+    // Step 2 of the builder: she answered the 3 questions. Skip the router.
     if (request.builderAnswers) {
-      return (await draftWithClaude(request, corpus)) ?? demo;
+      const complete: CompleteJson = async (system, user, schema) => {
+        const response = await client.beta.messages.create({
+          ...baseParams(),
+          output_config: { effort: "low", format: { type: "json_schema", schema } },
+          system,
+          messages: [{ role: "user", content: user }],
+        });
+        return response.stop_reason === "refusal" ? "" : textOf(response.content);
+      };
+      const draft = await draftSkill(complete, {
+        request: request.message,
+        baby,
+        answers: request.builderAnswers,
+        exampleMarkdown: corpus.exampleMarkdown,
+        safetyMarkdown: corpus.safetyMarkdown,
+      });
+      return {
+        reply:
+          "This is a new skill, written from what you just told me. Read what each part means, change anything you want, then save it.",
+        skillUsed: "create_skill",
+        mode: "draft",
+        results: draft,
+        learnPrompt: "Next time you can say what you want help with, and the moment it happened.",
+      };
     }
-    return (await routeWithClaude(request, corpus)) ?? demo;
+
+    const messages: BetaMessageParam[] = [{ role: "user", content: contextMessage(request, corpus) }];
+    let activities: Activity[] | null = null;
+    let createdSkill = false;
+
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const response = await client.beta.messages.create({
+        ...baseParams(),
+        output_config: { effort: "low", format: { type: "json_schema", schema: FINAL_SCHEMA } },
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        messages,
+      });
+
+      if (response.stop_reason === "refusal") {
+        throw new AgentUnavailableError(`Refused: ${response.stop_details?.category ?? "unknown"}`);
+      }
+
+      const toolUses = response.content.filter(
+        (block): block is Anthropic.Beta.BetaToolUseBlock => block.type === "tool_use",
+      );
+      // Thinking blocks go back unchanged with the rest of the turn.
+      messages.push({ role: "assistant", content: response.content });
+
+      if (toolUses.length === 0 || response.stop_reason !== "tool_use") {
+        const final = parseFinal(textOf(response.content));
+        if (createdSkill) {
+          return {
+            reply: final.reply,
+            skillUsed: "create_skill",
+            mode: "create",
+            results: CREATE_SKILL_QUESTIONS,
+            learnPrompt: final.learnPrompt,
+          };
+        }
+        if (activities) {
+          return {
+            reply: final.reply,
+            skillUsed: "montessori_activity",
+            mode: "use",
+            results: activities,
+            learnPrompt: final.learnPrompt,
+          };
+        }
+        const momSkill = (request.momSkills ?? []).find((skill) => skill.name === final.skillUsed);
+        return {
+          reply: final.reply,
+          skillUsed: momSkill ? momSkill.name : "",
+          mode: "use",
+          results: [],
+          learnPrompt: final.learnPrompt,
+        };
+      }
+
+      const results: BetaToolResultBlockParam[] = toolUses.map((tool) => {
+        if (tool.name === "montessori_activity") {
+          const input = tool.input as MontessoriToolInput;
+          activities = findActivities(corpus.activities, baby, {
+            ...input,
+            babyAgeMonths: baby?.ageMonths > 0 ? baby.ageMonths : input.babyAgeMonths,
+          });
+          return { type: "tool_result", tool_use_id: tool.id, content: JSON.stringify(activities) };
+        }
+        if (tool.name === "create_skill") {
+          const input = tool.input as CreateSkillToolInput;
+          createdSkill = true;
+          return {
+            type: "tool_result",
+            tool_use_id: tool.id,
+            content: JSON.stringify({
+              topic: input.topic,
+              questions: CREATE_SKILL_QUESTIONS,
+              note: "The app now asks her these 3 questions. In reply, tell her in one sentence that there is no skill for this yet and that 3 short questions will build one.",
+            }),
+          };
+        }
+        return { type: "tool_result", tool_use_id: tool.id, content: `Unknown tool ${tool.name}`, is_error: true };
+      });
+      messages.push({ role: "user", content: results });
+    }
+
+    throw new AgentUnavailableError("Too many tool turns");
   } catch (error) {
-    console.error(error instanceof Error ? error.message : FAIL);
-    return demo;
+    if (error instanceof Anthropic.APIError) {
+      throw new AgentUnavailableError(`Claude API error ${error.status}: ${error.message}`);
+    }
+    throw error;
   }
 }

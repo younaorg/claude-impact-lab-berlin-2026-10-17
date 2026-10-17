@@ -1,6 +1,43 @@
+import { DEMO_ACTIVITIES } from "../demo-activities";
 import type { Activity, Baby } from "../types";
 
+// Person 1: replace the second id with your second camera favorite once it is in activities.json.
 export const CAMERA_IDS = ["grasp-the-ring-5m", "conversation-with-pauses-5m"];
+
+/** Used only while data/activities.json is missing or empty, so the loop runs before research lands. */
+const SAMPLE_ACTIVITIES: Activity[] = DEMO_ACTIVITIES.filter(
+  (activity) => activity.ageMinMonths <= 4 && activity.ageMaxMonths >= 6,
+).slice(0, 3);
+
+export type MontessoriToolInput = {
+  babyAgeMonths: number;
+  situation?: string;
+  avoidIds?: string[];
+};
+
+/** The `montessori_activity` tool. `fileActivities` is the parsed data/activities.json. */
+export function findActivities(
+  fileActivities: Activity[],
+  baby: Baby,
+  input: MontessoriToolInput,
+): Activity[] {
+  const ageMonths = Number.isFinite(input.babyAgeMonths) && input.babyAgeMonths > 0
+    ? input.babyAgeMonths
+    : baby.ageMonths;
+  const filters: Baby = {
+    ...baby,
+    ageMonths,
+    completedActivityIds: [...baby.completedActivityIds, ...(input.avoidIds ?? [])],
+  };
+  const fromFile = selectActivities(fileActivities, filters);
+  if (fromFile.length >= 2) return fromFile;
+  // Research is still thin (or missing): top up with the samples so the mom sees 2 cards.
+  const ids = new Set(fileActivities.map((activity) => activity.id));
+  return selectActivities(
+    [...fileActivities, ...SAMPLE_ACTIVITIES.filter((activity) => !ids.has(activity.id))],
+    filters,
+  );
+}
 
 function isExact(activity: Activity, age: number) {
   return activity.ageMinMonths <= age && age <= activity.ageMaxMonths;
